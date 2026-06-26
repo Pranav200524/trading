@@ -381,7 +381,9 @@ def render_trade_table(df: pd.DataFrame) -> None:
         bg = STATUS_COLORS.get(raw, "#ffffff")
         return f"background-color: {bg}20; color: {bg}; font-weight: bold;"
 
-    styled = view.style.applymap(colour_status, subset=["Status"])
+    # Use Styler.map (pandas ≥2.1). Fall back to applymap on older pandas.
+    style_map = getattr(view.style, "map", None) or view.style.applymap
+    styled = style_map(colour_status, subset=["Status"])
     styled = styled.format({
         "Entry Time":     lambda x: x.strftime("%Y-%m-%d %H:%M IST") if pd.notna(x) else "—",
         "Exit Time":      lambda x: x.strftime("%Y-%m-%d %H:%M IST") if pd.notna(x) else "—",
