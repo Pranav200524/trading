@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.streamlit/
+db/*.db-shm
+db/*.db-wal
