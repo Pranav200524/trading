@@ -477,9 +477,11 @@ def render_zone_visualizer() -> None:
         selected = st.selectbox("Symbol", symbols, key="zviz_symbol")
     with col2:
         lookback = st.selectbox("Lookback",
-                                ["3M", "6M", "1Y", "2Y"], index=2, key="zviz_lookback")
+                                ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "All"],
+                                index=6, key="zviz_lookback")
 
-    days_map = {"3M": 90, "6M": 180, "1Y": 365, "2Y": 730}
+    days_map = {"3M": 90, "6M": 180, "1Y": 365, "2Y": 730,
+                "3Y": 1095, "5Y": 1825, "All": 100_000}
     prices = load_daily_prices(DB_PATH, selected, days=days_map[lookback])
     zones  = load_ml_zones(DB_PATH, selected)
 
@@ -559,6 +561,195 @@ def render_zone_visualizer() -> None:
         )
 
 
+def render_trade_replay(df: pd.DataFrame) -> None:
+    """Per-trade chart: daily candles + ML zones + entry/exit markers + T/SL lines.
+    Lets the user inspect WHY each BreakAndRetest entry fired."""
+    if df.empty:
+        st.info("No trades match the current sidebar filters.")
+        return
+
+    df = df.sort_values("entry_time", ascending=False).reset_index(drop=True)
+    df["label"] = df.apply(lambda r:
+        f"#{int(r['id'])} · {r['stock_name']} · {r['option_type']} · "
+        f"{pd.to_datetime(r['entry_time']).strftime('%Y-%m-%d %H:%M')} · "
+        f"{r['status']}",
+        axis=1,
+    )
+    pick = st.selectbox("Trade", df["label"].tolist(), key="replay_trade")
+    trade = df[df["label"] == pick].iloc[0]
+
+    stock_name   = trade["stock_name"]
+    entry_time   = pd.to_datetime(trade["entry_time"])
+    exit_time    = pd.to_datetime(trade["exit_time"]) if pd.notna(trade["exit_time"]) else None
+
+    # Wide window: 1 year before entry, 1 year after exit (or after entry if open).
+    win_start = (entry_time - pd.DateOffset(years=1)).date().isoformat()
+    win_end_dt = (exit_time if exit_time is not None else entry_time) + pd.DateOffset(years=1)
+    win_end   = win_end_dt.date().isoformat()
+
+    # Daily candles for the window
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # stock_name in trades_executed is a bare ticker like "RELIANCE";
+        # equity_daily_ohlc keys on the full Fyers symbol. Try both forms.
+        fyers_sym = f"NSE:{stock_name}-EQ"
+        prices = pd.read_sql_query(
+            "SELECT date, open, high, low, close FROM equity_daily_ohlc "
+            "WHERE symbol = ? AND date BETWEEN ? AND ? ORDER BY date",
+            conn, params=(fyers_sym, win_start, win_end),
+        )
+        zones = pd.read_sql_query(
+            "SELECT * FROM v_latest_zones WHERE stock_name = ? ORDER BY rank_order",
+            conn, params=(fyers_sym,),
+        )
+        conn.close()
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return
+
+    if prices.empty:
+        st.warning(f"No daily OHLC found for {fyers_sym} in window {win_start} → {win_end}.")
+        return
+    prices["date"] = pd.to_datetime(prices["date"])
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=prices["date"],
+        open=prices["open"], high=prices["high"],
+        low=prices["low"],   close=prices["close"],
+        name=fyers_sym,
+        increasing_line_color="#2ECC71",
+        decreasing_line_color="#E74C3C",
+    ))
+
+    # Back-calculate the zone that triggered the entry. For BreakAndRetest:
+    #   PE entry trigger = zone × 1.01   →  zone = entry / 1.01
+    #   CE entry trigger = zone × 0.99   →  zone = entry / 0.99
+    # For other strategies (no overshoot offset) the entry spot ≈ zone, so
+    # divide by 1.0.
+    if trade["strategy_name"] == "BreakAndRetest":
+        offset = 1.01 if trade["option_type"] == "PE" else 0.99
+    else:
+        offset = 1.00
+    target_zone_price = trade["entry_stock_price"] / offset
+
+    trigger_idx = None
+    if not zones.empty:
+        diffs = (zones["zone_price"] - target_zone_price).abs() / target_zone_price
+        best  = diffs.idxmin()
+        # Only highlight if the nearest zone is within 3% of where the math
+        # says it should be — guards against zones having been re-clustered
+        # since the trade fired.
+        if diffs.loc[best] <= 0.03:
+            trigger_idx = best
+
+    # Colour scheme — trigger zone vivid, all others dimmed grey so the chart
+    # makes it obvious which zone the trade fired against.
+    type_line = {
+        "support":       "#2ECC71",
+        "resistance":    "#E74C3C",
+        "role_reversal": "#3498DB",
+    }
+    DIM_FILL   = "rgba(150, 150, 150, 0.08)"
+    DIM_LINE   = "rgba(180, 180, 180, 0.45)"
+    HI_FILL    = "rgba(245, 166,  35, 0.35)"   # vivid amber for the trigger
+    HI_LINE    = "#F5A623"
+
+    x0, x1 = prices["date"].iloc[0], prices["date"].iloc[-1]
+    annotations = []
+    for idx, z in zones.iterrows():
+        ztype     = z["zone_type"]
+        is_trigger = (idx == trigger_idx)
+        fill_color = HI_FILL if is_trigger else DIM_FILL
+        line_color = HI_LINE if is_trigger else DIM_LINE
+        line_width = 2 if is_trigger else 1
+        fig.add_shape(
+            type="rect", xref="x", yref="y",
+            x0=x0, x1=x1,
+            y0=z["zone_low"], y1=z["zone_high"],
+            fillcolor=fill_color,
+            line=dict(color=line_color, width=line_width),
+            layer="below",
+        )
+        label = f"{ztype.upper()} @ {z['zone_price']:.2f}"
+        if ztype == "role_reversal" and pd.notna(z.get("flipped_to")):
+            label += f" → {z['flipped_to']}"
+        if is_trigger:
+            label = "● TRIGGER · " + label
+        annotations.append(dict(
+            x=x1, y=z["zone_price"], xref="x", yref="y",
+            text=label, showarrow=False,
+            xanchor="right", yanchor="middle",
+            font=dict(size=11 if is_trigger else 10,
+                       color=HI_LINE if is_trigger else DIM_LINE),
+        ))
+
+    # Target & stop-loss reference lines
+    fig.add_hline(y=trade["target_price"],   line_dash="dash", line_color="#2ECC71",
+                  annotation_text=f"Target {trade['target_price']:.2f}", annotation_position="left")
+    fig.add_hline(y=trade["stoploss_price"], line_dash="dash", line_color="#E74C3C",
+                  annotation_text=f"SL {trade['stoploss_price']:.2f}",   annotation_position="left")
+
+    # Entry marker — green ▲ for CE, red ▽ for PE
+    is_ce = trade["option_type"] == "CE"
+    fig.add_trace(go.Scatter(
+        x=[entry_time], y=[trade["entry_stock_price"]],
+        mode="markers+text",
+        marker=dict(symbol="triangle-up" if is_ce else "triangle-down",
+                    size=18,
+                    color="#2ECC71" if is_ce else "#E74C3C",
+                    line=dict(width=2, color="white")),
+        text=[f"  ENTRY {trade['option_type']} @ {trade['entry_stock_price']:.2f}"],
+        textposition="middle right",
+        textfont=dict(size=11),
+        name="Entry",
+    ))
+
+    if exit_time is not None and pd.notna(trade["exit_stock_price"]):
+        status_color = {
+            "CLOSED_TARGET":   "#2ECC71",
+            "CLOSED_STOPLOSS": "#E74C3C",
+            "CLOSED_EXPIRY":   "#8E8E93",
+            "CLOSED_ROLLED":   "#3498DB",
+        }.get(trade["status"], "#F5A623")
+        fig.add_trace(go.Scatter(
+            x=[exit_time], y=[trade["exit_stock_price"]],
+            mode="markers+text",
+            marker=dict(symbol="circle", size=14, color=status_color,
+                        line=dict(width=2, color="white")),
+            text=[f"  EXIT {trade['status'].replace('CLOSED_','')} @ {trade['exit_stock_price']:.2f}"],
+            textposition="middle right",
+            textfont=dict(size=11),
+            name="Exit",
+        ))
+
+    # Vertical reference line at entry time
+    fig.add_vline(x=entry_time, line_dash="dot", line_color="rgba(255,255,255,0.35)")
+
+    fig.update_layout(
+        height=560,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_rangeslider_visible=False,
+        annotations=annotations,
+        title=f"{stock_name} · {trade['option_type']} entry on "
+              f"{entry_time.strftime('%Y-%m-%d %H:%M')} · "
+              f"P&L = {trade['pnl'] if pd.notna(trade['pnl']) else '—'}",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Surface the entry context below the chart
+    info_cols = st.columns(4)
+    info_cols[0].metric("Entry Spot",   f"{trade['entry_stock_price']:.2f}")
+    info_cols[1].metric("Entry Premium", f"{trade['entry_option_premium']:.2f}")
+    info_cols[2].metric("Target",       f"{trade['target_price']:.2f}")
+    info_cols[3].metric("Stop-loss",    f"{trade['stoploss_price']:.2f}")
+
+    st.markdown(f"**Option symbol:** `{trade['option_symbol']}`  ·  "
+                f"**Strategy:** `{trade['strategy_name']}`  ·  "
+                f"**Status:** `{trade['status']}`")
+
+
 def render_cpr_levels() -> None:
     symbols = load_daily_symbols(DB_PATH)
     if not symbols:
@@ -628,8 +819,8 @@ def main() -> None:
     render_kpis(filtered)
     st.markdown("---")
 
-    tab_trades, tab_chart, tab_zviz, tab_zones, tab_cpr = st.tabs(
-        ["Trades", "P&L Chart", "Zone Chart", "ML Zones", "CPR Pivot Levels"]
+    tab_trades, tab_chart, tab_replay, tab_zviz, tab_zones, tab_cpr = st.tabs(
+        ["Trades", "P&L Chart", "Trade Replay", "Zone Chart", "ML Zones", "CPR Pivot Levels"]
     )
 
     with tab_trades:
@@ -637,6 +828,9 @@ def main() -> None:
 
     with tab_chart:
         render_pnl_chart(filtered)
+
+    with tab_replay:
+        render_trade_replay(filtered)
 
     with tab_zviz:
         render_zone_visualizer()
